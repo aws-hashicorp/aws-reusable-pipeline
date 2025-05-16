@@ -1,0 +1,315 @@
+name: AWS Terraform Plan
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        required: true
+        type: string
+      tf_bucket_name:
+        required: true
+        type: string
+      tf_state_file_name:
+        required: true
+        type: string
+      tf_version:
+        required: true
+        type: string
+      tf_vars_file:
+        required: false
+        type: string
+        default: ""
+      tf_refresh:
+        required: false
+        type: boolean
+        default: true
+      environment:
+        required: true
+        type: string
+      team:
+        required: true
+        type: string
+      tag-name:
+        required: false
+        type: string
+      tag-value:
+        required: false
+        type: string
+      role-duration-seconds:
+        required: false
+        type: number
+        default: 3600
+      checkov_skips:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      USER_GITHUB:
+        required: true
+      TOKEN_GITHUB:
+        required: true
+      AWS_ROLE_DEPLOY:
+        required: true
+      AWS_ACCOUNT_ID:
+        required: true
+      OTHERS:
+        required: true
+
+jobs:
+  check-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ⬇️ Clone Repository davivienda-colombia/davi-coe-aws-government-pipeline
+        uses: actions/checkout@v4
+        with:
+          repository: davivienda-colombia/davi-coe-aws-government-pipeline
+          ref: 'v0.5.0'
+          token: ${{ secrets.TOKEN_GITHUB }}
+          persist-credentials: false
+          path: ./.github/actions/davi-coe-aws-government-pipeline
+      - uses: ./.github/actions/davi-coe-aws-government-pipeline/file-structure-checker
+        with:
+          project-type: "proj"
+          target-dir: $GITHUB_WORKSPACE
+
+  plan:
+    needs: check-files
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      TF_BUCKET_NAME: ${{ inputs.tf_bucket_name }}
+      TF_STATE_FILE_NAME: ${{ inputs.tf_state_file_name }}
+      GITHUB_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+      TF_PLUGIN_CACHE_DIR: /home/runner/.terraform.d/plugins
+    defaults:
+      run:
+        working-directory: "."
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ secrets.AWS_ROLE_DEPLOY }}
+          role-duration-seconds: ${{ inputs.role-duration-seconds }}
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.TOKEN_GITHUB }}
+          persist-credentials: true
+      - name: 🔧 Configure Git Permissions
+        run: |
+          git config --local --remove-section http."https://github.com/"
+          git config --global url."https://${GH_USER}:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+        env:
+          GH_USER: ${{ secrets.USER_GITHUB }}
+          GH_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.tf_version }}
+          terraform_wrapper: true
+      - name: 🗃️ Download TF Actions
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: davivienda-colombia/davi-coe-aws-government-pipeline
+          ref: v0.5.0
+          token: ${{ secrets.TOKEN_GITHUB }}
+          persist-credentials: false
+          path: ./.github/actions/davi-coe-aws-government-pipeline
+
+      - name: 🗃️ Download TF Checks versions
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: davivienda-colombia/davi-arqs-action-check-versions-pipeline
+          ref: v0.1.0
+          token: ${{ secrets.TOKEN_GITHUB }}
+          persist-credentials: false
+          path: ./.github/actions/davi-arqs-action-check-versions-pipeline
+      - name: 🚀 Check Terraform Module Versions
+        uses: ./.github/actions/davi-arqs-action-check-versions-pipeline/terracheck
+        with:
+          github-token: ${{ secrets.TOKEN_GITHUB }}
+
+      - name: 🚀 Check Pipeline Versions
+        uses: ./.github/actions/davi-arqs-action-check-versions-pipeline/pipecheck
+        with:
+          github-token: ${{ secrets.TOKEN_GITHUB }}
+
+      - name: ✅ Terraform Fmt
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: false
+      - name: ✅ post-fmt
+        if: always() && github.ref != 'refs/heads/main' && (steps.fmt.outcome == 'success' || steps.fmt.outcome == 'failure')
+        uses: ./.github/actions/davi-coe-aws-government-pipeline/tf-pr-commenter
+        with:
+          commenter_type: fmt
+          commenter_input: ${{ format('{0}{1}', steps.fmt.outputs.stdout, steps.fmt.outputs.stderr) }}
+          commenter_exitcode: ${{ steps.fmt.outputs.exitcode }}
+      - name: 🚧 Create TF Plugins Directory
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          echo "TF plugins directory: $TF_PLUGIN_CACHE_DIR"
+
+      - name: 🌐 Terraform Init
+        id: init
+        run: |
+          echo "Installed plugins at $TF_PLUGIN_CACHE_DIR:"
+          ls "$TF_PLUGIN_CACHE_DIR"
+
+          terraform init \
+            -input=false \
+            -backend-config="bucket=$TF_BUCKET_NAME" \
+            -backend-config="key=$TF_STATE_FILE_NAME" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true"
+      - name: ♻️ Terraform Validate
+        id: validate
+        run: terraform validate
+      - name: post-validate
+        if: always() && github.ref != 'refs/heads/main' && (steps.validate.outcome == 'success' || steps.validate.outcome == 'failure')
+        uses: ./.github/actions/davi-coe-aws-government-pipeline/tf-pr-commenter
+        with:
+          commenter_type: validate
+          commenter_input: ${{ format('{0}{1}', steps.validate.outputs.stdout, steps.validate.outputs.stderr) }}
+          commenter_exitcode: ${{ steps.validate.outputs.exitcode }}
+      - name: ✏️ Terraform Vars
+        id: tf-auth
+        run: |
+          curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value' > /tmp/web_identity_token_file
+          env_vars=$(echo $env_vars | tr "," "\n")
+
+          for env_var in $env_vars; do
+            env_var_config=(${env_var//=/ })
+            env_var_name=${env_var_config[0]}
+            env_var_value=${env_var_config[1]}
+
+            if [[ "$env_var_name" == *"TF_VAR_"* ]]; then
+              echo "::add-mask::$env_var_value"
+              echo "$env_var_name=$env_var_value" >> $GITHUB_ENV
+            fi
+          done
+        env:
+          env_vars: ${{ secrets.OTHERS }}
+      - name: 🔊 Terraform Plan
+        id: plan
+        run: |
+          if [ -z "$tf_vars_file" ]; then
+            terraform plan -input=false -compact-warnings -out=tfplan -no-color -refresh=$tf_refresh
+          else
+            terraform plan -input=false -compact-warnings -var-file=$tf_vars_file -out=tfplan -no-color -refresh=$tf_refresh
+          fi
+        env:
+          tf_refresh: ${{ inputs.tf_refresh }}
+          tf_vars_file: ${{ inputs.tf_vars_file }}
+      - name: 🧐 Terraform Show
+        id: show
+        run: terraform show tfplan -no-color
+      - name: post-plan
+        if: always() && github.ref != 'refs/heads/main' && (steps.plan.outcome == 'success' || steps.plan.outcome == 'failure')
+        uses: ./.github/actions/davi-coe-aws-government-pipeline/tf-pr-commenter
+        continue-on-error: true
+        with:
+          commenter_type: plan
+          commenter_input: ${{ format('{0}{1}', steps.show.outputs.stdout, steps.show.outputs.stderr) }}
+          commenter_exitcode: ${{ steps.plan.outputs.exitcode }}
+      - name: 🧑‍💻 save tfplan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+          retention-days: 1
+
+  checkov:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      issues: read
+      checks: write
+      pull-requests: write
+    needs:
+      - check-files
+    env:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      TF_BUCKET_NAME: ${{ inputs.tf_bucket_name }}
+      TF_STATE_FILE_NAME: ${{ inputs.tf_state_file_name }}
+      REPO_NAME: ${{ github.event.repository.name }}
+      TF_PLUGIN_CACHE_DIR: /home/runner/.terraform.d/plugins
+    defaults:
+      run:
+        working-directory: "."
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_DEPLOY }}
+          aws-region: ${{ inputs.aws_region }}
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.TOKEN_GITHUB }}
+          persist-credentials: true
+      - name: 🔧 Configure Git Permissions
+        run: |
+          git config --local --remove-section http."https://github.com/"
+          git config --global url."https://${GH_USER}:${GH_TOKEN}@github.com/davivienda-colombia".insteadOf "https://github.com/davivienda-colombia"
+        env:
+          GH_USER: ${{ secrets.USER_GITHUB }}
+          GH_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.tf_version }}
+          terraform_wrapper: false
+      - name: ⬇️ Download TF Actions
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: davivienda-colombia/davi-coe-aws-government-pipeline
+          ref: 'v0.5.0'
+          token: ${{ secrets.TOKEN_GITHUB }}
+          persist-credentials: true
+          path: ./.github/actions/davi-coe-aws-government-pipeline
+      - name: 🚧 Create TF Plugins Directory
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          echo "TF plugins directory: $TF_PLUGIN_CACHE_DIR"
+      - name: 🌐 Terraform Init
+        id: init
+        run: |
+          echo "Installed plugins at $TF_PLUGIN_CACHE_DIR:"
+          ls "$TF_PLUGIN_CACHE_DIR"
+
+          terraform init \
+            -input=false \
+            -backend-config="bucket=$TF_BUCKET_NAME" \
+            -backend-config="key=$TF_STATE_FILE_NAME" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true"
+      - name: 🧪 Run Checkov Action
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          output_file_path: 'results.xml,'
+          directory: "."
+          quiet: true
+          soft_fail: false
+          framework: terraform
+          output_format: junitxml
+          download_external_modules: true
+          skip_check: ${{ inputs.checkov_skips }}
+          log_level: DEBUG
+      - name: 🧐 Publish checkov results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          junit_files: results.xml
+          check_name: Checkov Scan Results
+          github_token: ${{ github.token }}

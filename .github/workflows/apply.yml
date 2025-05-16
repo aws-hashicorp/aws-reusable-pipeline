@@ -1,0 +1,148 @@
+name: AWS Terraform Apply
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        required: true
+        type: string
+      tf_bucket_name:
+        required: true
+        type: string
+      tf_state_file_name:
+        required: true
+        type: string
+      tf_version:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      workflow:
+        required: true
+        type: string
+      role-duration-seconds:
+        required: false
+        type: number
+        default: 3600
+    secrets:
+      USER_GITHUB:
+        required: true
+      TOKEN_GITHUB:
+        required: true
+      AWS_ROLE_DEPLOY:
+        required: true
+      AWS_ACCOUNT_ID:
+        required: true
+      ARTIFACTORY_READER_USER:
+        required: false
+      ARTIFACTORY_READER_API_KEY:
+        required: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
+      TF_BUCKET_NAME: ${{ inputs.tf_bucket_name }}
+      TF_STATE_FILE_NAME: ${{ inputs.tf_state_file_name }}
+      REPO_NAME: ${{ github.event.repository.name }}
+      TF_PLUGIN_CACHE_DIR: /home/runner/.terraform.d/plugins
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ secrets.AWS_ROLE_DEPLOY }}
+          role-duration-seconds: ${{ inputs.role-duration-seconds }}
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.TOKEN_GITHUB }}
+          persist-credentials: true
+          submodules: recursive
+      - name: Authenticate Jfrog
+        env:
+          ARTIFACTORY_READER_USER: ${{ secrets.ARTIFACTORY_READER_USER }}
+          ARTIFACTORY_READER_API_KEY: ${{ secrets.ARTIFACTORY_READER_API_KEY }}
+        run: curl -u "$ARTIFACTORY_READER_USER:$ARTIFACTORY_READER_API_KEY" 'https://davicienda.jfrog.io/artifactory/api/npm/npm-davi/auth/npm-davi' >> ~/.npmrc
+      - name: 🔧 Configure Git permissions
+        run: |
+          git config --local --remove-section http."https://github.com/"
+          git config --global url."https://${GH_USER}:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+        env:
+          GH_USER: ${{ secrets.USER_GITHUB }}
+          GH_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.tf_version }}
+          terraform_wrapper: true
+      - name: 👷 Get Pull Request
+        id: get-pr-number
+        run: |
+          PULL_REQUEST_NUMBER=$(gh pr list --state merged --search ${{ github.sha }} --base ${{ github.ref_name }} --json number --jq '.[].number')
+          echo Pull request number is: $PULL_REQUEST_NUMBER
+          echo "::set-output name=pull_request_number::${PULL_REQUEST_NUMBER}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+      - name: ⬇️ Download TF Actions
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: davivienda-colombia/davi-coe-aws-government-pipeline
+          ref: 'v0.5.0'
+          token: ${{ secrets.TOKEN_GITHUB }}
+          persist-credentials: false
+          path: ./.github/actions/davi-coe-aws-government-pipeline
+      - name: 🚧 Create TF Plugins Directory
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          echo "TF plugins directory: $TF_PLUGIN_CACHE_DIR"
+      - name: 🌐 Terraform Init
+        id: init
+        run: |
+          echo "Installed plugins at $TF_PLUGIN_CACHE_DIR:"
+          ls "$TF_PLUGIN_CACHE_DIR"
+
+          terraform init \
+            -input=false \
+            -backend-config="bucket=$TF_BUCKET_NAME" \
+            -backend-config="key=$TF_STATE_FILE_NAME" \
+            -backend-config="region=$AWS_DEFAULT_REGION" \
+            -backend-config="encrypt=true"
+      - name: ⏪️ Download tfplan
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          name: tfplan
+          workflow_conclusion: success
+          workflow: ${{ inputs.workflow }}
+          github_token: ${{ secrets.TOKEN_GITHUB }}
+          pr: ${{ steps.get-pr-number.outputs.pull_request_number }}
+
+      - name: 📦 Checkout reusable pipeline repo for payload
+        uses: actions/checkout@v4
+        with:
+          repository: davivienda-colombia/davi-coe-aws-reusable-pipeline
+          token: ${{ secrets.TOKEN_GITHUB }}
+          path: reusable-pipeline
+
+      - name: 📦 Check and Copy Lambda Payload
+        run: |
+          if [ -f "reusable-pipeline/scripts/payload.zip" ]; then
+            echo "payload.zip exists, copying to the necessary locations."
+            chmod +x reusable-pipeline/scripts/payload-lambda.sh
+            reusable-pipeline/scripts/payload-lambda.sh
+          else
+            echo "payload.zip not found, skipping Lambda payload copy."
+          fi
+
+      - name: 📸 Terraform Show
+        id: show
+        run: terraform show tfplan
+      - name: 💥 Terraform Apply
+        id: apply
+        run: terraform apply -input=false -compact-warnings -auto-approve tfplan
